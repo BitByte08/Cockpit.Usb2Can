@@ -20,8 +20,9 @@ static const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 static const twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
 // Simple ASCII protocol:
-// Host -> ESP: "T <ID_HEX> <LEN> <BYTE_HEX> ...\n" (eg: T 1FF 8 DE AD BE EF 00 11 22 33) sends a frame
-// ESP -> Host: "F <ID_HEX> <LEN> <BYTE_HEX> ...\n" when a CAN frame is received
+// Host -> ESP: "t<ID_HEX><BYTE_HEX>...\n" (eg: t1FFDEADBEEF00112233) sends a frame
+// ESP -> Host: "t<ID_HEX><BYTE_HEX>...\n" when a CAN frame is received
+// ID is 3 hex digits, data bytes are 2 hex digits each without spaces
 
 static void init_uart()
 {
@@ -84,36 +85,46 @@ static void uart_rx_task(void *arg)
 			if (data[idx] == '\r') continue;
 			if (data[idx] == '\n') {
 				data[idx] = 0;
-				// parse line
-				if (idx > 0 && (data[0] == 'T' || data[0] == 't')) {
-					// Expected: T ID LEN BYTES...
+				// parse line: t<ID_HEX><DATA_BYTES>
+				if (idx >= 4 && (data[0] == 'T' || data[0] == 't')) {
 					char *p = (char *)data + 1;
-					// skip spaces
-					while (*p == ' ' || *p == '\t') p++;
-					uint32_t id = hex_to_u32(p);
-					// move p past id
-					while (*p && *p != ' ' && *p != '\t') p++;
-					while (*p == ' ' || *p == '\t') p++;
-					int dlc = atoi(p);
-					// move p past dlc
-					while (*p && *p != ' ' && *p != '\t') p++;
-					while (*p == ' ' || *p == '\t') p++;
-
+					
+					// Parse 3-digit hex ID
+					uint32_t id = 0;
+					for (int i = 0; i < 3 && *p; i++) {
+						char c = *p++;
+						uint8_t d = 0;
+						if (c >= '0' && c <= '9') d = c - '0';
+						else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+						else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+						else { id = 0; break; }
+						id = (id << 4) | d;
+					}
+					
+					// Parse remaining data bytes (2 hex digits each)
 					twai_message_t msg;
 					memset(&msg, 0, sizeof(msg));
 					msg.identifier = id;
 					msg.extd = (id > 0x7FF) ? 1 : 0;
-					msg.data_length_code = dlc > 8 ? 8 : dlc;
-
-					for (int i = 0; i < msg.data_length_code; ++i) {
-						// parse next hex byte
-						if (!*p) break;
-						uint32_t b = hex_to_u32(p);
-						msg.data[i] = (uint8_t)b;
-						// advance p past this byte token
-						while (*p && *p != ' ' && *p != '\t') p++;
-						while (*p == ' ' || *p == '\t') p++;
+					
+					int dlc = 0;
+					while (*p && dlc < 8) {
+						// Parse 2 hex digits for one byte
+						uint32_t b = 0;
+						for (int i = 0; i < 2 && *p; i++) {
+							char c = *p++;
+							uint8_t d = 0;
+							if (c >= '0' && c <= '9') d = c - '0';
+							else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+							else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+							else { b = 0xFF; break; }
+							b = (b << 4) | d;
+						}
+						if (b <= 0xFF) {
+							msg.data[dlc++] = (uint8_t)b;
+						}
 					}
+					msg.data_length_code = dlc;
 
 					esp_err_t res = twai_transmit(&msg, pdMS_TO_TICKS(1000));
 					if (res == ESP_OK) {
@@ -142,13 +153,13 @@ static void twai_rx_task(void *arg)
 		twai_message_t msg;
 		esp_err_t ret = twai_receive(&msg, pdMS_TO_TICKS(1000));
 		if (ret == ESP_OK) {
-			// format: F ID LEN BYTES...\n
-			char out[128];
+			// format: t<ID_HEX><DATA_BYTES>\n (no spaces)
+			char out[64];
 			int pos = 0;
-			pos += snprintf(out + pos, sizeof(out) - pos, "F %03X %d", msg.identifier & 0x1FFFFFFF, msg.data_length_code);
+			pos += snprintf(out + pos, sizeof(out) - pos, "t%03X", msg.identifier & 0x1FFFFFFF);
 			for (int i = 0; i < msg.data_length_code; ++i) {
-				pos += snprintf(out + pos, sizeof(out) - pos, " %02X", msg.data[i]);
-				if (pos >= (int)sizeof(out) - 10) break;
+				pos += snprintf(out + pos, sizeof(out) - pos, "%02X", msg.data[i]);
+				if (pos >= (int)sizeof(out) - 4) break;
 			}
 			pos += snprintf(out + pos, sizeof(out) - pos, "\n");
 			uart_write_bytes(UART_PORT, out, pos);
