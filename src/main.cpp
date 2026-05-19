@@ -54,11 +54,13 @@ static void init_twai()
 		status.state, status.arb_lost_count, (unsigned long)status.msgs_to_rx, (unsigned long)status.msgs_to_tx);
 }
 
-static uint32_t hex_to_u32(const char *s)
+/* Read exactly n hex characters from s. Stops early on non-hex or NUL. */
+static uint32_t hex_to_u32_n(const char *s, int n)
 {
 	uint32_t v = 0;
-	while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') {
-		char c = *s++;
+	for (int i = 0; i < n; i++) {
+		char c = s[i];
+		if (!c) break;
 		uint8_t d = 0;
 		if (c >= '0' && c <= '9') d = c - '0';
 		else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
@@ -82,31 +84,60 @@ static void usb_rx_task(void *arg)
 				data[idx] = 0;
 				// parse line
 				if (idx >= 4 && (data[0] == 'T' || data[0] == 't')) {
-					// Expected: t<ID><DATA>
+					// SLCAN format: t{ID:3hex}{DLC:1hex}{DATA:2*DLChex}
+					// Example: t105200FF → ID=0x105, DLC=2, Data=[0x00,0xFF]
 					char *p = (char *)data + 1;
-					uint32_t id = hex_to_u32(p);
+					/* Read exactly 3 hex chars for 11-bit standard CAN ID.
+					 * hex_to_u32 was greedy and consumed "1052FF3F" entirely → wrong 29-bit ID. */
+					uint32_t id = hex_to_u32_n(p, 3);
 					p += 3;
+
+					// Read DLC from position 4 (1 hex digit)
+					uint8_t dlc = 0;
+					if (*p >= '0' && *p <= '9') dlc = *p - '0';
+					else if (*p >= 'A' && *p <= 'F') dlc = *p - 'A' + 10;
+					else if (*p >= 'a' && *p <= 'f') dlc = *p - 'a' + 10;
+					if (dlc > 8) dlc = 8;
+					p++;  // skip DLC byte
 
 					twai_message_t msg;
 					memset(&msg, 0, sizeof(msg));
 					msg.identifier = id;
-					msg.extd = (id > 0x7FF) ? 1 : 0;
-
-					int dlc = 0;
-					while (*p && dlc < 8) {
-						uint32_t b = hex_to_u32(p);
-						msg.data[dlc++] = (uint8_t)b;
-						p += 2;
-					}
+					msg.extd = 0;  // always standard frame from SLCAN 't' command
 					msg.data_length_code = dlc;
 
+					// Read exactly dlc data bytes (exactly 2 hex chars each)
+					for (int i = 0; i < (int)dlc && *p; i++) {
+						msg.data[i] = (uint8_t)hex_to_u32_n(p, 2);
+						p += 2;
+					}
+
 					esp_err_t res = twai_transmit(&msg, pdMS_TO_TICKS(1000));
-					if (res == ESP_OK) {
-						const char *ok = "OK\n";
-						usb_serial_jtag_write_bytes(ok, strlen(ok), pdMS_TO_TICKS(100));
-					} else {
-						const char *err = "ERR\n";
-						usb_serial_jtag_write_bytes(err, strlen(err), pdMS_TO_TICKS(100));
+					/* Always report TWAI bus status so we can detect bus-off / no-ACK situations.
+					 * OK = frame queued in TX buffer, NOT confirmed sent on bus.
+					 * If tx_err > 0 or state != 1 (RUNNING): STM32 is not ACKing → physical bus broken. */
+					{
+						twai_status_info_t st;
+						twai_get_status_info(&st);
+						char resp[128];
+						int rlen;
+						if (res == ESP_OK) {
+							rlen = snprintf(resp, sizeof(resp),
+								"OK id=%03lX state=%d tx_err=%lu rx_err=%lu\n",
+								(unsigned long)msg.identifier,
+								(int)st.state,
+								(unsigned long)st.tx_error_counter,
+								(unsigned long)st.rx_error_counter);
+						} else {
+							rlen = snprintf(resp, sizeof(resp),
+								"ERR id=%03lX state=%d tx_err=%lu rx_err=%lu arb=%lu res=%d\n",
+								(unsigned long)msg.identifier,
+								(int)st.state,
+								(unsigned long)st.tx_error_counter,
+								(unsigned long)st.rx_error_counter,
+								(unsigned long)st.arb_lost_count, res);
+						}
+						usb_serial_jtag_write_bytes(resp, rlen, pdMS_TO_TICKS(100));
 					}
 				}
 				idx = 0;
